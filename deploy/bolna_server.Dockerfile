@@ -14,5 +14,5 @@ RUN pip install torchaudio==2.0.1
 RUN pip install pydub==0.25.1
 RUN pip install ffprobe
 
-EXPOSE 5001
-CMD ["uvicorn", "quickstart_server:app", "--host", "0.0.0.0", "--port", "5001"]
+EXPOSE $PORT
+CMD ["uvicorn", "quickstart_server:app", "--host", "0.0.0.0", "--port", "$PORT"]

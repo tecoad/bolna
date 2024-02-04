@@ -6,6 +6,5 @@ COPY /deploy/twilio_api_server.py /app
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-EXPOSE 8001
-
-CMD ["uvicorn", "twilio_api_server:app", "--host", "0.0.0.0", "--port", "8001"]
+EXPOSE $PORT
+CMD ["uvicorn", "twilio_api_server:app", "--host", "0.0.0.0", "--port", "$PORT"]
