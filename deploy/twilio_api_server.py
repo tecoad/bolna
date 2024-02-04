@@ -11,7 +11,7 @@ from fastapi.responses import PlainTextResponse
 
 app = FastAPI()
 load_dotenv()
-port = 8001
+port = os.getenv('PORT')
 
 twilio_account_sid = os.getenv('TWILIO_ACCOUNT_SID')
 twilio_auth_token = os.getenv('TWILIO_AUTH_TOKEN')
