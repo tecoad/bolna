@@ -1,7 +1,9 @@
 import asyncio
+from collections import defaultdict
 import traceback
 import time
 import json
+import uuid
 from .base_manager import BaseManager
 from bolna.agent_types import *
 from bolna.providers import *
@@ -19,6 +21,10 @@ class TaskManager(BaseManager):
                  assistant_id=None, run_id=None, connected_through_dashboard=False, 
                  cache =  None, input_queue = None, conversation_history = None, output_queue = None, **kwargs):
         super().__init__()
+        # Latency and logging 
+        self.latency_dict = defaultdict(dict)
+
+
         logger.info(f"doing task {task}")
         self.task_id = task_id
         self.assistant_name = assistant_name
@@ -213,6 +219,7 @@ class TaskManager(BaseManager):
             self.tools["webhook_agent"] = ZapierAgent(zap_url = zap_url)
 
         logger.info("prompt and config setup completed")
+        
     
     ########################
     # Load prompts
@@ -267,6 +274,9 @@ class TaskManager(BaseManager):
                 text_chunk = text_chunk[:-4]
 
         logger.info("received text from LLM for output processing: {}".format(text_chunk))
+        if "request_id" not in meta_info:
+            meta_info["request_id"] = str(uuid.uuid4())
+        self.latency_dict[meta_info["request_id"]]["llm"] = { "first_buffer_latency": time.time() - meta_info["start_time"]}
         if next_step == "synthesizer" and not should_bypass_synth:
             task = asyncio.gather(self._synthesize(create_ws_data_packet(text_chunk, meta_info)))
             self.synthesizer_tasks.append(asyncio.ensure_future(task))
@@ -308,13 +318,15 @@ class TaskManager(BaseManager):
 
 
             json_data = await self.tools["llm_agent"].generate(self.history)
-            if self.task_config["task_type"] == "summary":
+            if self.task_config["task_type"] == "summarization":
                 logger.info(f'Summary {json_data["summary"]}')
                 self.summarized_data = json_data["summary"]
+                logger.info(f"self.summarize {self.summarized_data}")
             else:
                 json_data = clean_json_string(json_data)
                 logger.info(f"After replacing {json_data}")
-                json_data = json.loads(json_data)
+                if type(json_data) is not dict:
+                    json_data = json.loads(json_data)
                 self.extracted_data = json_data
         logger.info("Done")
 
@@ -375,6 +387,7 @@ class TaskManager(BaseManager):
 
     async def _process_conversation_task(self, message, sequence, meta_info):
         next_step = None
+        
         logger.info("agent flow is not preprocessed")
         llm_response = ""
         self.history.append({
@@ -386,6 +399,7 @@ class TaskManager(BaseManager):
         next_step = self._get_next_step(sequence, "llm")
         self.curr_sequence_id +=1
         meta_info["sequence_id"] = self.curr_sequence_id
+        meta_info['start_time'] = time.time()
         cache_response =  self.cache.get(get_md5_hash(message['data'])) if self.cache is not None else None
         if cache_response is not None:
             logger.info("It was a cache hit and hence simply returning")
@@ -572,7 +586,12 @@ class TaskManager(BaseManager):
                             message = self.history[-1]['content'] + " " + transcriber_message
                             self.history = self.history[:-1]
                             self.was_long_pause = False
-
+                        
+                        meta_info = message['meta_info']
+                        logger.info(f"@@@@@@@@ META INFO {meta_info}")
+                        include_latency = meta_info.get("include_latency", False)
+                        if include_latency:
+                            self.latency_dict[meta_info['request_id']]["transcriber"] = {"total_latency":  meta_info["transcriber_latency"], "audio_duration": meta_info["audio_duration"], "last_vocal_frame_timestamp": meta_info["last_vocal_frame_timestamp"] }
                         logger.info(f'invoking next_task {next_task} with transcriber_message: {transcriber_message}')
                         if len(transcriber_message.strip()) != 0:
                             await self._handle_transcriber_output(next_task, transcriber_message, meta_info)
@@ -584,11 +603,16 @@ class TaskManager(BaseManager):
                 else:
                     logger.info("Not a streaming conversation. Hence getting a full blown transcript")
                     message = await self.transcriber_output_queue.get()
+                    meta_info = message['meta_info']
                     logger.info(f"message from transcriber {message}")
                     if message['data'] == "transcriber_connection_closed":
                         self.transcriber_duration += message['meta_info']["transcriber_duration"]
                         logger.info("transcriber connection closed")
                         break
+                    include_latency = meta_info.get("include_latency", False)
+                    if include_latency:
+                        self.latency_dict[meta_info['request_id']]["transcriber"] = {"total_latency":  meta_info["transcriber_latency"], "audio_duration": meta_info["audio_duration"], "last_vocal_frame_timestamp": meta_info["last_vocal_frame_timestamp"] }
+
                     sequence = message["meta_info"]["sequence"]
                     next_task = self._get_next_step(sequence, "transcriber")
                     self.transcriber_duration += message["meta_info"]["transcriber_duration"] if "transcriber_duration" in message["meta_info"] else 0
@@ -609,14 +633,25 @@ class TaskManager(BaseManager):
                         logger.info(f"{message['meta_info']['sequence_id'] } is in sequence ids  {self.sequence_ids} and hence removing the sequence ids ")
                         if self.stream:   
                             if self.synthesizer_provider == "polly":
+                                if message['meta_info']['is_first_chunk']:
+                                    first_chunk_generation_timestamp = time.time()
+                                    self.latency_dict[message['meta_info']["request_id"]]['synthesizer'] = {"first_chunk_generation_latency": first_chunk_generation_timestamp - message['meta_info']['synthesizer_start_time'], "first_chunk_generation_timestamp": first_chunk_generation_timestamp}
+                                
                                 for chunk in yield_chunks_from_memory(message['data'], chunk_size=16384):
                                     await self.tools["output"].handle(create_ws_data_packet(chunk, message["meta_info"]))
                             else:
                                 if self.task_config["tools_config"]["output"]["provider"] == "twilio" and not self.connected_through_dashboard and self.synthesizer_provider == "elevenlabs":
                                     message['data'] = wav_bytes_to_pcm(message['data'])
+                                
+                                if "is_first_chunk" in  message['meta_info'] and message['meta_info']['is_first_chunk']:
+                                    first_chunk_generation_timestamp = time.time()
+                                    self.latency_dict[message['meta_info']["request_id"]]['synthesizer'] = {"first_chunk_generation_latency": first_chunk_generation_timestamp - message['meta_info']['synthesizer_start_time'], "first_chunk_generation_timestamp": first_chunk_generation_timestamp}
+                                
                                 await self.tools["output"].handle(message)
                         else:
                             logger.info("Stream is not enabled and hence sending entire audio")
+                            first_chunk_generation_timestamp = time.time()
+                            self.latency_dict[message['meta_info']["request_id"]]['synthesizer'] = {"first_chunk_generation_latency": first_chunk_generation_timestamp - message['meta_info']['synthesizer_start_time'], "first_chunk_generation_timestamp": first_chunk_generation_timestamp}
                             await self.tools["output"].handle(message)
                     else:
                         logger.info(f"{message['meta_info']['sequence_id']} is not in sequence ids  {self.sequence_ids} and hence not sending to output")                
@@ -630,6 +665,7 @@ class TaskManager(BaseManager):
         meta_info = message["meta_info"]
         text = message["data"]
         meta_info["type"] = "audio"
+        meta_info["synthesizer_start_time"] = time.time()
         try:
             if meta_info["is_md5_hash"]:
                 logger.info('sending preprocessed audio response to {}'.format(
@@ -647,7 +683,6 @@ class TaskManager(BaseManager):
                     audio_chunk = await get_raw_audio_bytes_from_base64(self.assistant_name, text,
                                                                     'pcm', local=self.is_local,
                                                                     assistant_id=self.assistant_id)
-                    #await self.tools["output"].handle(create_ws_data_packet(audio_chunk, meta_info))
                     for chunk in  yield_chunks_from_memory(audio_chunk, chunk_size=16384):
                         await self.tools["output"].handle(create_ws_data_packet(chunk, meta_info))
             elif self.synthesizer_provider in SUPPORTED_SYNTHESIZER_MODELS.keys():
@@ -730,12 +765,14 @@ class TaskManager(BaseManager):
                 output = {"messages": self.history, "conversation_time": time.time() - self.start_time,
                           "label_flow": self.label_flow, "call_sid": self.call_sid, "stream_sid": self.stream_sid,
                           "transcriber_duration": self.transcriber_duration,
-                          "synthesizer_characters": self.synthesizer_characters, "ended_by_assistant": self.ended_by_assistant}
+                          "synthesizer_characters": self.synthesizer_characters, "ended_by_assistant": self.ended_by_assistant,
+                          "latency_dict": self.latency_dict}
             else:
                 output = self.input_parameters
                 if self.task_config["task_type"] == "extraction":
                     output = { "extracted_data" : self.extracted_data, "task_type": "extraction"}
                 elif self.task_config["task_type"] == "summarization":
+                    logger.info(f"self.summarized_data {self.summarized_data}")
                     output = {"summary" : self.summarized_data, "task_type": "summarization"}
                 elif self.task_config["task_type"] == "webhook":
                     output = {"status" : self.webhook_response, "task_type": "webhook"}
