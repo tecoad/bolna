@@ -35,9 +35,12 @@ class OpenAiLLM(BaseLLM):
                 self.model_args["top_k"] = kwargs["top_k"]
             logger.info(f"Using VLLM model base_url {base_url} and model {self.model} and api key {api_key}")
         else:
-            self.async_client = AsyncOpenAI(
-            api_key=kwargs.get('llm_key', os.getenv('OPENAI_API_KEY'))
-        )
+            llm_key = kwargs.get('llm_key', os.getenv('OPENAI_API_KEY'))
+            if llm_key != "sk-":
+                llm_key = os.getenv('OPENAI_API_KEY')
+            else:
+                llm_key = kwargs['llm_key']
+            self.async_client = AsyncOpenAI(api_key=llm_key)
         
         if "top_p" in kwargs:
             self.model_args["top_p"] = kwargs["top_p"]
@@ -49,6 +52,9 @@ class OpenAiLLM(BaseLLM):
             self.model_args["frequency_penalty"] = kwargs["frequency_penalty"]
 
     async def generate_stream(self, messages, classification_task=False, synthesize=True, request_json=False):
+        if len(messages) == 0:
+            raise Exception("No messages provided")
+        
         response_format = self.get_response_format(request_json)
 
         answer, buffer = "", ""

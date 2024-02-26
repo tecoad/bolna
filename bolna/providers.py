@@ -1,7 +1,7 @@
 from .synthesizer import PollySynthesizer, XTTSSynthesizer, ElevenlabsSynthesizer, OPENAISynthesizer, FourieSynthesizer
 from .transcriber import DeepgramTranscriber
-from .input_handlers import DefaultInputHandler, TwilioInputHandler
-from .output_handlers import DefaultOutputHandler, TwilioOutputHandler
+from .input_handlers import DefaultInputHandler, TwilioInputHandler, ExotelInputHandler
+from .output_handlers import DefaultOutputHandler, TwilioOutputHandler, ExotelOutputHandler
 from .llms import OpenAiLLM, LiteLLM
 
 SUPPORTED_SYNTHESIZER_MODELS = {
@@ -12,7 +12,8 @@ SUPPORTED_SYNTHESIZER_MODELS = {
     "fourie": FourieSynthesizer
 }
 SUPPORTED_TRANSCRIBER_MODELS = {
-    'deepgram': DeepgramTranscriber
+    'deepgram': DeepgramTranscriber,
+    'whisper': DeepgramTranscriber #Seperate out a transcriber for https://github.com/bolna-ai/streaming-transcriber-server or build a deepgram compatible proxy
 }
 SUPPORTED_LLM_MODELS = {
     'openai': OpenAiLLM,
@@ -26,9 +27,19 @@ SUPPORTED_LLM_MODELS = {
 }
 SUPPORTED_INPUT_HANDLERS = {
     'default': DefaultInputHandler,
-    'twilio': TwilioInputHandler
+    'twilio': TwilioInputHandler,
+    'exotel': ExotelInputHandler
+}
+SUPPORTED_INPUT_TELEPHONY_HANDLERS = {
+    'twilio': TwilioInputHandler,
+    'exotel': ExotelInputHandler
 }
 SUPPORTED_OUTPUT_HANDLERS = {
     'default': DefaultOutputHandler,
-    'twilio': TwilioOutputHandler
+    'twilio': TwilioOutputHandler,
+    'exotel': ExotelOutputHandler
+}
+SUPPORTED_OUTPUT_TELEPHONY_HANDLERS = {
+    'twilio': TwilioOutputHandler,
+    'exotel': ExotelOutputHandler
 }

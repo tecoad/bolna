@@ -1,4 +1,5 @@
 import asyncio
+import traceback
 import numpy as np
 import torch
 import websockets
@@ -11,14 +12,16 @@ from .base_transcriber import BaseTranscriber
 from bolna.helpers.logger_config import configure_logger
 from bolna.helpers.utils import create_ws_data_packet, int2float
 from bolna.helpers.vad import VAD
+
 torch.set_num_threads(1)
 
 logger = configure_logger(__name__)
 load_dotenv()
 
+
 class DeepgramTranscriber(BaseTranscriber):
     def __init__(self, provider, input_queue=None, model='deepgram', stream=True, language="en", endpointing="400",
-                 sampling_rate="16000", encoding="linear16", output_queue= None, **kwargs):
+                 sampling_rate="16000", encoding="linear16", output_queue= None, keywords = None, **kwargs):
         super().__init__(input_queue)
         self.endpointing = endpointing
         self.language = language
@@ -33,6 +36,7 @@ class DeepgramTranscriber(BaseTranscriber):
         self.transcriber_output_queue = output_queue
         self.transcription_task = None
         self.on_device_vad = kwargs.get("on_device_vad", False) if self.stream else False
+        self.keywords = keywords
         logger.info(f"self.stream: {self.stream}")
         if self.on_device_vad:
             self.vad_model = VAD()
@@ -43,30 +47,59 @@ class DeepgramTranscriber(BaseTranscriber):
         self.interruption_signalled = False
         self.sampling_rate = 16000
         if not self.stream:
-            self.session = aiohttp.ClientSession()
             self.api_url = f"https://api.deepgram.com/v1/listen?model=nova-2&filler_words=true&language={self.language}"
+            self.session = aiohttp.ClientSession()
+            if self.keywords is not None:
+                keyword_string = "&keywords=" + "&keywords=".join(self.keywords.split(","))
+                self.api_url = f"{self.api_url}{keyword_string}"
         self.audio_submitted = False
         self.audio_submission_time = None
+        self.num_frames = 0
+        self.connection_start_time = None
+        self.process_interim_results = "true"
+        #Work on this soon
+        self.last_utterance_time_stamp = time.time()
+        self.utterance_end_task= None
+    
+    def __get_speaker_transcript(self, data):
+        transcript_words = []
+        if 'channel' in data and 'alternatives' in data['channel']:
+            for alternative in data['channel']['alternatives']:
+                if 'words' in alternative:
+                    for word_info in alternative['words']:
+                        if word_info['speaker'] == 0:
+                            transcript_words.append(word_info['word'])
+
+        return ' '.join(transcript_words)
 
     def get_deepgram_ws_url(self):
         websocket_url = (f"wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1"
-                         f"&filler_words=true&endpointing={self.endpointing}")
-        self.first_audio_wav_duration = 0.5 #We're sending 8k samples with a sample rate of 16k
+                         f"&filler_words=true&interim_results={self.process_interim_results}&diarize=true&utterance_end_ms=1000")
+        self.audio_frame_duration = 0.5 #We're sending 8k samples with a sample rate of 16k
 
-        if self.provider == 'twilio':
-            websocket_url = (f"wss://api.deepgram.com/v1/listen?model=nova-2&encoding=mulaw&sample_rate=8000&channels"
-                             f"=1&filler_words=true&endpointing={self.endpointing}")
+        if self.provider in ('twilio', 'exotel'):
             self.sampling_rate = 8000
-            self.first_audio_wav_duration = 0.1
+            self.audio_frame_duration = 0.2  # With telephony we are sending 100ms at a time
+
+            if self.provider == 'twilio':
+                self.encoding = 'mulaw'
+
+            websocket_url = (f"wss://api.deepgram.com/v1/listen?model=nova-2&encoding={self.encoding}&sample_rate={self.sampling_rate}&channels"
+                             f"=1&filler_words=true&interim_results={self.process_interim_results}&diarize=true&utterance_end_ms=1000")
 
         if self.provider == "playground":
             websocket_url = (f"wss://api.deepgram.com/v1/listen?model=nova-2&encoding=opus&sample_rate=8000&channels"
-                             f"=1&filler_words=true&endpointing={self.endpointing}")
+                             f"=1&filler_words=true&interim_results={self.process_interim_results}&diarize=true&utterance_end_ms=1000")
             self.sampling_rate = 8000
-            self.first_audio_wav_duration = 0.0 #There's no streaming from the playground 
+            self.audio_frame_duration = 0.0 #There's no streaming from the playground 
 
         if "en" not in self.language:
             websocket_url += '&language={}'.format(self.language)
+        
+        if self.keywords is not None:
+            keyword_string = "&keywords=" + "&keywords=".join(self.keywords.split(","))
+            websocket_url = f"{websocket_url}{keyword_string}"
+        logger.info(f"Deepgram websocket url: {websocket_url}")
         return websocket_url
 
     async def send_heartbeat(self, ws):
@@ -83,7 +116,7 @@ class DeepgramTranscriber(BaseTranscriber):
         self.connection_on = False
         if self.heartbeat_task is not None:
             self.heartbeat_task.cancel()
-        await self.sender_task.cancel()
+        self.sender_task.cancel()
 
     async def _get_http_transcription(self, audio_data):
         if self.session is None or self.session.closed:
@@ -115,6 +148,9 @@ class DeepgramTranscriber(BaseTranscriber):
 
         return False
 
+    def get_meta_info(self):
+        return self.meta_info
+    
     async def sender(self, ws=None):
         try:
             while True:
@@ -132,7 +168,7 @@ class DeepgramTranscriber(BaseTranscriber):
                 transcription['meta_info']["include_latency"] = True
                 transcription['meta_info']["transcriber_latency"] = time.time() - start_time
                 transcription['meta_info']['audio_duration'] = transcription['meta_info']['transcriber_duration']
-                transcription['meta_info']['last_vocal_frame_timestamp'] = start_time = time.time()
+                transcription['meta_info']['last_vocal_frame_timestamp'] = start_time
                 yield transcription
 
             if self.transcription_task is not None:
@@ -145,7 +181,6 @@ class DeepgramTranscriber(BaseTranscriber):
             raise Exception("Something went wrong")
 
     async def __check_for_vad(self, data):
-        start_time = time.time()
         if data is None:
             return
         self.audio.append(data)
@@ -153,7 +188,6 @@ class DeepgramTranscriber(BaseTranscriber):
         audio_int16 = np.frombuffer(audio_bytes, np.int16)
         frame_np = int2float(audio_int16)
         
-
         speech_prob = self.vad_model(torch.from_numpy(frame_np.copy()), self.sampling_rate).item()
         logger.info(f"Speech probability {speech_prob}")
         if float(speech_prob) >= float(self.voice_threshold):
@@ -181,6 +215,7 @@ class DeepgramTranscriber(BaseTranscriber):
                 end_of_stream = await self._check_and_process_end_of_stream(ws_data_packet, ws)
                 if end_of_stream:
                     break
+                self.num_frames +=1
                 await ws.send(ws_data_packet.get('data'))
 
         except Exception as e:
@@ -189,50 +224,95 @@ class DeepgramTranscriber(BaseTranscriber):
 
     async def receiver(self, ws):
         curr_message = ""
+        finalized_transcript= ""
         async for msg in ws:
             try:
                 msg = json.loads(msg)
+
+                #If connection start time is None, connection start time is the duratons of frame submitted till now minus current time
+                if self.connection_start_time is None:
+                    self.connection_start_time = (time.time() - (self.num_frames * self.audio_frame_duration))
+                    logger.info(f"Connecton start time {self.connection_start_time} {self.num_frames} and {self.audio_frame_duration}")
+
+                logger.info(f"###### ######### ############# Message from the transcriber {msg}")
                 if msg['type'] == "Metadata":
                     logger.info(f"Got a summary object {msg}")
                     self.meta_info["transcriber_duration"] = msg["duration"]
                     yield create_ws_data_packet("transcriber_connection_closed", self.meta_info)
                     return
+                
+                #TODO LATENCY STUFF
+                if msg["type"] == "UtteranceEnd":
+                    logger.info("Transcriber Latency: {} for request id {}".format(time.time() - self.audio_submission_time, self.current_request_id))
+                    logger.info(f"Current message during UtteranceEnd {curr_message}")
+                    self.meta_info["start_time"] = self.audio_submission_time
+                    self.meta_info["end_time"] = time.time() - 100
+                    self.meta_info['speech_final'] = True
+                    self.audio_submitted = False
+                    self.meta_info["include_latency"] = True
+                    self.meta_info["audio_duration"] = 10
+                    last_spoken_audio_frame = self.connection_start_time + 10
+                    self.meta_info["audio_start_time"] = self.audio_submission_time 
+                    transcription_completion_time = time.time()
+                    self.meta_info["transcription_completion_time"] = transcription_completion_time
+                    # abs because sometimes it's negative. Got to debug that further  
+                    self.meta_info["last_vocal_frame_timestamp"] = last_spoken_audio_frame
+                    if curr_message == "":
+                        continue
+                    logger.info(f"Signalling the Task manager to start speaking")
+                    yield create_ws_data_packet(finalized_transcript, self.meta_info)
+                    curr_message = ""
+                    finalized_transcript = ""
+                    continue
+                
+                # if msg["type"] == "SpeechStarted":
+                #     if not self.on_device_vad:
+                #         logger.info("Not on device vad and hence inetrrupting")
+                #         yield create_ws_data_packet("TRANSCRIBER_BEGIN", self.meta_info)
+                #     continue
 
                 transcript = msg['channel']['alternatives'][0]['transcript']
 
-                self.update_meta_info()
+                if transcript and len(transcript.strip()) == 0 or transcript == "":
+                    continue
+                
+                #TODO Remove the need for on_device_vad
+                # If interim message is not true and curr message is null, send a begin signal
+                if curr_message == "" and msg["is_final"] == False:
+                    if not self.on_device_vad:
+                        logger.info("Not on device vad and hence inetrrupting")
+                        self.meta_info["should_interrupt"] = True
+                    yield create_ws_data_packet("TRANSCRIBER_BEGIN", self.meta_info)
 
-                if transcript and len(transcript.strip()) != 0:
-                    if curr_message == "":
-                        if not self.on_device_vad:
-                            logger.info("Not on device vad and hence inetrrupting")
-                            self.meta_info["should_interrupt"] = True
-                        yield create_ws_data_packet("TRANSCRIBER_BEGIN", self.meta_info)
-                    curr_message += " " + transcript
+                    await asyncio.sleep(0.1) #Enable taskmanager to interrupt
 
-                if msg["speech_final"]  or not self.stream:
-                    logger.info(f"Full Transcriber message {msg}")
-                    await self.push_to_transcriber_queue(create_ws_data_packet(curr_message, self.meta_info))
-                    logger.info('User: {}'.format(curr_message))
-                    
-                    self.interruption_signalled = False
-                    if self.audio_submitted == True:
-                        logger.info("Transcriber Latency: {} for request id {}".format(time.time() - self.audio_submission_time, self.current_request_id))
-                        self.meta_info["start_time"] = self.audio_submission_time
-                        self.meta_info["end_time"] = time.time()
-                        self.audio_submitted = False
-                    if curr_message != "":
-                        self.meta_info["include_latency"] = True
-                        self.meta_info["audio_duration"] = msg['duration']  
-                        last_spoken_audio_frame = (self.audio_submission_time - self.first_audio_wav_duration) + float(msg['duration'])
-                        # abs because sometimes due to network delays duration from deepgram is higher  
-                        self.meta_info["transcriber_latency"] = abs(time.time() - last_spoken_audio_frame)  #We subtract first audio wav because user started speaking then. In this case we can calculate actual latency taken by the transcriber
-                        self.meta_info["last_vocal_frame_timestamp"] = last_spoken_audio_frame
-                    else:
-                        self.meta_info["include_latency"] = False
-                    yield create_ws_data_packet("TRANSCRIBER_END", self.meta_info)
-                    curr_message = ""
+                #Do not send back interim results, just send back interim message
+                if self.process_interim_results and msg["is_final"] == True:    
+                    logger.info(f"Is final interim Transcriber message {msg}")
+                    #curr_message = self.__get_speaker_transcript(msg)
+                    finalized_transcript += " " + transcript #Just get the whole transcript as there's mismatch at times
+                    self.meta_info["is_final"] = True
+                    if transcript.strip() != curr_message.strip():
+                        yield create_ws_data_packet(curr_message, self.meta_info)
+                else:
+                    #If we're not processing interim results
+                    # Yield current transcript
+                    #curr_message = self.__get_speaker_transcript(msg)
+                    # Just yield the current transcript as we do not want to wait for is_final. Is_final is just to make 
+                    curr_message = finalized_transcript + " " + transcript
+                    logger.info(f"Yielding interim-message current_message = {curr_message}")
+                    self.meta_info["include_latency"] = False
+                    self.meta_info["utterance_end"] = self.__calculate_utterance_end(msg)
+                    self.meta_info["time_received"] = time.time()
+                    self.meta_info["transcriber_latency"] =  self.meta_info["time_received"] - self.meta_info["utterance_end"] 
+                    yield create_ws_data_packet(curr_message, self.meta_info)
+                    # #If the current message is empty no need to send anything to the task manager
+                    # if curr_message == "":
+                    #     continue
+                    #yield create_ws_data_packet(curr_message, self.meta_info)
+                    #curr_message = ""
             except Exception as e:
+                traceback.print_exc()
                 logger.error(f"Error while getting transcriptions {e}")
                 self.interruption_signalled = False
                 yield create_ws_data_packet("TRANSCRIBER_END", self.meta_info)
@@ -246,11 +326,20 @@ class DeepgramTranscriber(BaseTranscriber):
             'Authorization': 'Token {}'.format(os.getenv('DEEPGRAM_AUTH_TOKEN'))
         }
         deepgram_ws = websockets.connect(websocket_url, extra_headers=extra_headers)
-
         return deepgram_ws
 
     async def run(self):
         self.transcription_task = asyncio.create_task(self.transcribe())
+
+    def __calculate_utterance_end(self,data):
+        utterance_end = ''
+        if 'channel' in data and 'alternatives' in data['channel']:
+            for alternative in data['channel']['alternatives']:
+                if 'words' in alternative:
+                    final_word =  alternative['words'][-1]
+                    utterance_end = self.connection_start_time + final_word['end'] 
+                    logger.info(f"Final word ended at {utterance_end}")
+        return utterance_end
 
     async def transcribe(self):
         try:
