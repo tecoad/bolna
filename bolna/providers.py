@@ -1,4 +1,4 @@
-from .synthesizer import PollySynthesizer, XTTSSynthesizer, ElevenlabsSynthesizer, OPENAISynthesizer, FourieSynthesizer
+from .synthesizer import PollySynthesizer, XTTSSynthesizer, ElevenlabsSynthesizer, OPENAISynthesizer, FourieSynthesizer, DeepgramSynthesizer
 from .transcriber import DeepgramTranscriber
 from .input_handlers import DefaultInputHandler, TwilioInputHandler, ExotelInputHandler
 from .output_handlers import DefaultOutputHandler, TwilioOutputHandler, ExotelOutputHandler
@@ -7,9 +7,10 @@ from .llms import OpenAiLLM, LiteLLM
 SUPPORTED_SYNTHESIZER_MODELS = {
     'polly': PollySynthesizer,
     'xtts': XTTSSynthesizer,
-    "elevenlabs": ElevenlabsSynthesizer,
-    "openai": OPENAISynthesizer,
-    "fourie": FourieSynthesizer
+    'elevenlabs': ElevenlabsSynthesizer,
+    'openai': OPENAISynthesizer,
+    'fourie': FourieSynthesizer,
+    'deepgram': DeepgramSynthesizer
 }
 SUPPORTED_TRANSCRIBER_MODELS = {
     'deepgram': DeepgramTranscriber,
@@ -22,6 +23,7 @@ SUPPORTED_LLM_MODELS = {
     'mistral': LiteLLM,
     'llama': LiteLLM,
     'zephyr': LiteLLM,
+    'azure-openai': LiteLLM,
     'perplexity': LiteLLM,
     'vllm': OpenAiLLM
 }
